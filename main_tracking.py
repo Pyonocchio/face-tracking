@@ -1,206 +1,192 @@
-# main_tracking.py (YOLOv5 object detection 기반 눈 감음 분석 포함)
-# - 지정된 사람 얼굴 추적
-# - 정확한 3D 좌표(x, y, z) 추출
-# - 거리 시각화 + 눈 감음(open/closed) 분석
-
 import os
-import argparse
 import blobconverter
 import cv2
 import depthai as dai
 import numpy as np
+import datetime
 from MultiMsgSync import TwoStageHostSeqSync
-from distance import DistanceGuardian
 
-# === 설정 ===
-EYE_STATE_BLOB_PATH = "pyono-results/result/best_openvino_2022.1_6shave.blob"
-EYE_CLASSES = ['closed-eyes', 'open-eyes']
+VIDEO_SIZE = (1072, 1072)
+EYE_STATE_CLASSES = ['closed-eyes', 'open-eyes']
 
-parser = argparse.ArgumentParser()
-parser.add_argument("-target", "--target", type=str, required=True, help="추적할 사람 이름")
-args = parser.parse_args()
-TARGET_NAME = args.target
-
-# bounding box 변환
-def frame_norm(frame, bbox):
-    normVals = np.full(len(bbox), frame.shape[0])
-    normVals[::2] = frame.shape[1]
-    return (np.clip(np.array(bbox), 0, 1) * normVals).astype(int)
-
-# YOLOv5 output 파싱
-def parse_yolo_detections(output, conf_thres=0.5):
-    detections = []
-    num_det = len(output) // 7
-    output = np.array(output).reshape((num_det, 7))
-
-    for det in output:
-        conf = det[4]
-        if conf < conf_thres:
-            continue
-        class_scores = det[5:]
-        class_id = int(np.argmax(class_scores))
-        detections.append({
-            'confidence': conf,
-            'class_id': class_id,
-            'label': EYE_CLASSES[class_id] if class_id < len(EYE_CLASSES) else 'unknown'
-        })
-    return detections
-
-# 텍스트 출력 클래스
 class TextHelper:
-    def __init__(self):
+    def __init__(self) -> None:
         self.bg_color = (0, 0, 0)
         self.color = (255, 255, 255)
         self.text_type = cv2.FONT_HERSHEY_SIMPLEX
         self.line_type = cv2.LINE_AA
-
     def putText(self, frame, text, coords):
-        cv2.putText(frame, text, coords, self.text_type, 0.7, self.bg_color, 4, self.line_type)
-        cv2.putText(frame, text, coords, self.text_type, 0.7, self.color, 2, self.line_type)
+        cv2.putText(frame, text, coords, self.text_type, 1.0, self.bg_color, 4, self.line_type)
+        cv2.putText(frame, text, coords, self.text_type, 1.0, self.color, 2, self.line_type)
 
-# 얼굴 인식 클래스
 class FaceRecognition:
-    def __init__(self, db_path):
-        self.db_dic = {}
-        self.labels = []
-        for file in os.listdir(db_path):
-            if file.endswith(".npz"):
-                label = os.path.splitext(file)[0]
-                with np.load(os.path.join(db_path, file)) as db:
-                    self.db_dic[label] = [db[k] for k in db.files]
-                    self.labels.append(label)
+    def __init__(self, db_path) -> None:
+        self.read_db(db_path)
 
     def cosine_distance(self, a, b):
         a_norm = np.linalg.norm(a)
         b_norm = np.linalg.norm(b)
         return np.dot(a, b.T) / (a_norm * b_norm)
 
-    def recognize(self, feature):
-        max_sim = -1
-        match_label = "UNKNOWN"
+    def new_recognition(self, results):
+        max_, label_ = 0, "UNKNOWN"
         for label in self.labels:
-            for db_vec in self.db_dic[label]:
-                sim = self.cosine_distance(feature, db_vec)
-                if sim > max_sim:
-                    max_sim = sim
-                    match_label = label
-        return match_label, max_sim
+            for j in self.db_dic.get(label):
+                conf = self.cosine_distance(j, results)
+                if conf > max_:
+                    max_ = conf
+                    label_ = label
+        if max_ >= 0.5:
+            return max_, label_
+        else:
+            return 1 - max_, "UNKNOWN"
 
-# Pipeline 구성
+    def read_db(self, databases_path):
+        self.labels = []
+        self.db_dic = {}
+        for file in os.listdir(databases_path):
+            if file.endswith(".npz"):
+                label = os.path.splitext(file)[0]
+                self.labels.append(label)
+                with np.load(os.path.join(databases_path, file)) as db:
+                    self.db_dic[label] = [db[j] for j in db.files]
+
+def notify_parent(child_name):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[ALERT] {timestamp} - {child_name} has opened their eyes! Notify the parent.")
+
+def frame_norm(frame, bbox):
+    normVals = np.full(len(bbox), frame.shape[0])
+    normVals[::2] = frame.shape[1]
+    return (np.clip(np.array(bbox), 0, 1) * normVals).astype(int)
+
+print("Creating pipeline...")
 pipeline = dai.Pipeline()
 
-# RGB 카메라
 cam = pipeline.create(dai.node.ColorCamera)
-cam.setPreviewSize(300, 300)
+cam.setPreviewSize(640, 640)
+cam.setVideoSize(VIDEO_SIZE)
 cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
 cam.setInterleaved(False)
-cam.setBoardSocket(dai.CameraBoardSocket.RGB)
+cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
 
-# StereoDepth
-left = pipeline.create(dai.node.MonoCamera)
-right = pipeline.create(dai.node.MonoCamera)
-left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-left.setBoardSocket(dai.CameraBoardSocket.LEFT)
-right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+xout_cam = pipeline.create(dai.node.XLinkOut)
+xout_cam.setStreamName("color")
+cam.video.link(xout_cam.input)
 
-stereo = pipeline.create(dai.node.StereoDepth)
-stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
-stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
-left.out.link(stereo.left)
-right.out.link(stereo.right)
+copy_manip = pipeline.create(dai.node.ImageManip)
+cam.preview.link(copy_manip.inputImage)
+copy_manip.setNumFramesPool(20)
+copy_manip.setMaxOutputFrameSize(3 * 640 * 640)
 
-# 눈 상태 분석
+face_det_manip = pipeline.create(dai.node.ImageManip)
+face_det_manip.initialConfig.setResize(300, 300)
+copy_manip.out.link(face_det_manip.inputImage)
+
+face_det_nn = pipeline.create(dai.node.MobileNetDetectionNetwork)
+face_det_nn.setConfidenceThreshold(0.5)
+face_det_nn.setBlobPath(blobconverter.from_zoo(name="face-detection-retail-0004", shaves=6))
+face_det_manip.out.link(face_det_nn.input)
+
+face_det_xout = pipeline.create(dai.node.XLinkOut)
+face_det_xout.setStreamName("detection")
+face_det_nn.out.link(face_det_xout.input)
+
+# Headpose
+headpose_manip = pipeline.create(dai.node.ImageManip)
+headpose_manip.initialConfig.setResize(60, 60)
+headpose_manip.inputConfig.setWaitForMessage(False)
+copy_manip.out.link(headpose_manip.inputImage)
+
+headpose_nn = pipeline.create(dai.node.NeuralNetwork)
+headpose_nn.setBlobPath(blobconverter.from_zoo(name="head-pose-estimation-adas-0001", shaves=6))
+headpose_manip.out.link(headpose_nn.input)
+
+# Face Recognition
+face_rec_manip = pipeline.create(dai.node.ImageManip)
+face_rec_manip.initialConfig.setResize(112, 112)
+face_rec_manip.inputConfig.setWaitForMessage(False)
+copy_manip.out.link(face_rec_manip.inputImage)
+
+face_rec_nn = pipeline.create(dai.node.NeuralNetwork)
+face_rec_nn.setBlobPath(blobconverter.from_zoo(name="face-recognition-arcface-112x112", zoo_type="depthai", shaves=6))
+face_rec_manip.out.link(face_rec_nn.input)
+
+arc_xout = pipeline.create(dai.node.XLinkOut)
+arc_xout.setStreamName("recognition")
+face_rec_nn.out.link(arc_xout.input)
+
+# Eye classification (custom trained model)
 eye_manip = pipeline.create(dai.node.ImageManip)
-eye_manip.initialConfig.setResize(416, 416)
-eye_manip.setMaxOutputFrameSize(3 * 416 * 416)
-cam.preview.link(eye_manip.inputImage)
+eye_manip.initialConfig.setResize(640, 640)
+eye_manip.setMaxOutputFrameSize(3 * 640 * 640)
+eye_manip.inputConfig.setWaitForMessage(False)
+copy_manip.out.link(eye_manip.inputImage)
 
 eye_nn = pipeline.create(dai.node.NeuralNetwork)
-eye_nn.setBlobPath(EYE_STATE_BLOB_PATH)
+eye_nn.setBlobPath("pyono-results/result/best_openvino_2022.1_6shave.blob")
 eye_manip.out.link(eye_nn.input)
 
-# 얼굴 탐지
-manip = pipeline.create(dai.node.ImageManip)
-manip.initialConfig.setResize(300, 300)
-cam.preview.link(manip.inputImage)
+eye_xout = pipeline.create(dai.node.XLinkOut)
+eye_xout.setStreamName("eye")
+eye_nn.out.link(eye_xout.input)
 
-det_nn = pipeline.create(dai.node.MobileNetSpatialDetectionNetwork)
-det_nn.setBlobPath(blobconverter.from_zoo(name="face-detection-retail-0004", shaves=6))
-det_nn.setConfidenceThreshold(0.5)
-det_nn.input.setBlocking(False)
-manip.out.link(det_nn.input)
-stereo.depth.link(det_nn.inputDepth)
-
-# ArcFace
-rec_manip = pipeline.create(dai.node.ImageManip)
-rec_manip.initialConfig.setResize(112, 112)
-cam.preview.link(rec_manip.inputImage)
-
-rec_nn = pipeline.create(dai.node.NeuralNetwork)
-rec_nn.setBlobPath(blobconverter.from_zoo(name="face-recognition-arcface-112x112", zoo_type="depthai", shaves=6))
-rec_manip.out.link(rec_nn.input)
-
-# 출력 큐
-for name, node in zip(["color", "detection", "recognition", "eye"], [cam.preview, det_nn.out, rec_nn.out, eye_nn.out]):
-    out = pipeline.create(dai.node.XLinkOut)
-    out.setStreamName(name)
-    node.link(out.input)
-
-# 실행 루프
 with dai.Device(pipeline) as device:
-    recog = FaceRecognition("databases")
+    facerec = FaceRecognition("databases")
+    sync = TwoStageHostSeqSync(include_eye=True)
     text = TextHelper()
-    guardian = DistanceGuardian(max_distance=1.5)
-    sync = TwoStageHostSeqSync(include_eye=True)  # eye 동기화 포함
 
-    queues = {name: device.getOutputQueue(name) for name in ["color", "detection", "recognition", "eye"]}
+    queues = {}
+    for name in ["color", "detection", "recognition", "eye"]:
+        queues[name] = device.getOutputQueue(name)
 
     while True:
         for name, q in queues.items():
-            if q.has(): sync.add_msg(q.get(), name)
+            if q.has():
+                sync.add_msg(q.get(), name)
+
         msgs = sync.get_msgs()
-        if msgs is None: continue
+        if msgs is not None:
+            frame = msgs["color"].getCvFrame()
+            dets = msgs["detection"].detections
 
-        frame = msgs["color"].getCvFrame()
-        detections = msgs["detection"].detections
-        detections_with_xyz = []
-
-        # 눈 상태 추론
-        eye_status = "unknown"
-        try:
-            eye_output = msgs["eye"].getFirstLayerFp16()
-            parsed = parse_yolo_detections(eye_output)
-            if parsed:
-                eye_status = parsed[0]['label']
-        except: pass
-
-        for i, det in enumerate(detections):
-            bbox = frame_norm(frame, (det.xmin, det.ymin, det.xmax, det.ymax))
-            center_x = int((bbox[0] + bbox[2]) / 2)
-            center_y = int((bbox[1] + bbox[3]) / 2)
-
-            x = det.spatialCoordinates.x / 1000
-            y = det.spatialCoordinates.y / 1000
-            z = det.spatialCoordinates.z / 1000
-
-            feature = np.array(msgs["recognition"][i].getFirstLayerFp16())
-            name, conf = recog.recognize(feature)
-
-            text.putText(frame, f"{name} ({conf*100:.0f}%)", (bbox[0], bbox[1]-100))
-            text.putText(frame, f"Eyes: {eye_status}", (bbox[0], bbox[1]-80))
-            text.putText(frame, f"X: {x:.2f}m", (bbox[0], bbox[1]-60))
-            text.putText(frame, f"Y: {y:.2f}m", (bbox[0], bbox[1]-40))
-            text.putText(frame, f"Z: {z:.2f}m", (bbox[0], bbox[1]-20))
-            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0,255,0), 2)
-
-            detections_with_xyz.append({ 'xyz': (x,y,z), 'center': (center_x, center_y), 'name': name })
-
-            if name == TARGET_NAME and conf >= 0.5:
-                print(f"[추적] {name} 위치: X={x:.2f} Y={y:.2f} Z={z:.2f}, 눈: {eye_status}")
+            recog_list = msgs.get("recognition", [])
+            eye_list = msgs.get("eye", [])
+            if isinstance(eye_list, list):
+                if len(eye_list) == 1:
+                    eye_scores = np.array(eye_list[0].getFirstLayerFp16()).reshape(-1)
+                else:
+                    eye_scores = []
             else:
-                print(f"[무시] {name} 은(는) 추적 대상 아님")
+                eye_scores = np.array(eye_list.getFirstLayerFp16()).reshape(-1)
 
-        guardian.visualize(frame, guardian.parse_detections(detections_with_xyz))
-        cv2.imshow("Tracking", cv2.resize(frame, (800, 800)))
-        if cv2.waitKey(1) == ord('q'): break
+            for i, detection in enumerate(dets):
+                xmin, ymin, xmax, ymax = detection.xmin, detection.ymin, detection.xmax, detection.ymax
+                bbox = frame_norm(frame, (xmin, ymin, xmax, ymax))
+                cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (10, 245, 10), 2)
+
+                # Face recognition
+                if i < len(recog_list):
+                    features = np.array(recog_list[i].getFirstLayerFp16())
+                    conf, name = facerec.new_recognition(features)
+                    text.putText(frame, f"{name} {(100*conf):.0f}%", (bbox[0] + 10, bbox[1] + 35))
+                else:
+                    name = "UNKNOWN"
+                    text.putText(frame, name, (bbox[0] + 10, bbox[1] + 35))
+
+                # Eye state
+                if eye_scores is None or len(eye_scores) != len(EYE_STATE_CLASSES):
+                    text.putText(frame, "Eye: ???", (bbox[0] + 10, bbox[1] + 60))
+                else:
+                    eye_idx = int(np.argmax(eye_scores))
+                    eye_state = EYE_STATE_CLASSES[eye_idx]
+                    # eye_conf = eye_scores[eye_idx]
+                    # text.putText(frame, f"Eye: {eye_state} ({eye_conf:.2f})", (bbox[0] + 10, bbox[1] + 60))
+                    text.putText(frame, f"Eye: {eye_state}", (bbox[0]+10, bbox[1]+60))
+                    if name != "UNKNOWN" and eye_state == "open-eyes":
+                        notify_parent(name)
+
+            cv2.imshow("color", cv2.resize(frame, (800, 800)))
+        if cv2.waitKey(1) == ord('q'):
+            break
+    cv2.destroyAllWindows()
